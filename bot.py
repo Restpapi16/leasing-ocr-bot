@@ -34,11 +34,13 @@ OPENAI_MODEL     = os.getenv("OPENAI_MODEL", "gpt-4o")
 AMO_SUBDOMAIN    = os.getenv("AMO_SUBDOMAIN", "")          # yourcompany (без .amocrm.ru)
 AMO_ACCESS_TOKEN = os.getenv("AMO_ACCESS_TOKEN", "")       # Long-lived OAuth2 access token
 
-# ─── ID кастомных полей AmoCRM (заполни сам!) ──────────────────────────────────
-# Поля КОМПАНИИ (custom fields)
-COMPANY_FIELD_INN   = 711641   # TODO: вставь ID кастомного поля ИНН компании
-COMPANY_FIELD_AGENT = 711655   # TODO: вставь ID кастомного поля ФИО агента компании
-# Телефон — СТАНДАРТНОЕ поле AmoCRM, записывается через ключ "phone" в теле запроса
+# ─── ID кастомных полей AmoCRM ───────────────────────────────────────────────
+COMPANY_FIELD_INN   = 711641   # ID кастомного поля ИНН компании
+COMPANY_FIELD_AGENT = 711655   # ID кастомного поля ФИО агента компании
+# Телефон — СТАНДАРТНОЕ поле AmoCRM, записывается через ключ "phone"
+
+# ID этапа воронки, на котором создаётся сделка
+DEAL_PIPELINE_STATUS_ID = 70009922
 
 # ─── Состояния ConversationHandler ───────────────────────────────────────────
 WAIT_PHOTO = 1
@@ -113,7 +115,6 @@ async def _find_or_create_company(company_name: str, inn: Optional[str]) -> int:
     base_url = f"https://{AMO_SUBDOMAIN}.amocrm.ru/api/v4"
 
     async with httpx.AsyncClient() as client:
-        # Поиск по названию
         resp = await client.get(
             f"{base_url}/companies",
             headers=_amo_headers(),
@@ -124,7 +125,6 @@ async def _find_or_create_company(company_name: str, inn: Optional[str]) -> int:
             if items:
                 company_id = items[0]["id"]
                 logger.info("Компания найдена: id=%s", company_id)
-                # Обновляем кастомное поле ИНН если есть
                 if inn and COMPANY_FIELD_INN:
                     await client.patch(
                         f"{base_url}/companies/{company_id}",
@@ -137,7 +137,6 @@ async def _find_or_create_company(company_name: str, inn: Optional[str]) -> int:
                     )
                 return company_id
 
-        # Компания не найдена — создаём
         payload: dict = {"name": company_name}
         if inn and COMPANY_FIELD_INN:
             payload["custom_fields_values"] = [
@@ -158,19 +157,13 @@ async def _find_or_create_company(company_name: str, inn: Optional[str]) -> int:
 async def _update_company_phone(company_id: int, phone: str) -> None:
     """
     Записывает телефон в СТАНДАРТНОЕ поле компании.
-    В AmoCRM это ключ "phone" верхнего уровня, а НЕ custom_fields_values.
     """
     base_url = f"https://{AMO_SUBDOMAIN}.amocrm.ru/api/v4"
-    payload = {
-        "phone": [
-            {"value": phone, "enum_code": "WORK"}
-        ]
-    }
     async with httpx.AsyncClient() as client:
         resp = await client.patch(
             f"{base_url}/companies/{company_id}",
             headers=_amo_headers(),
-            json=payload,
+            json={"phone": [{"value": phone, "enum_code": "WORK"}]},
         )
         resp.raise_for_status()
         logger.info("Телефон компании обновлён: %s", phone)
@@ -185,7 +178,7 @@ async def _create_deal(
     inn: Optional[str],
 ) -> int:
     """
-    Создаёт сделку в AmoCRM и привязывает компанию.
+    Создаёт сделку в AmoCRM на этапе DEAL_PIPELINE_STATUS_ID и привязывает компанию.
     Весь текст OCR идёт в примечание сделки.
     Возвращает ID созданной сделки.
     """
@@ -193,13 +186,13 @@ async def _create_deal(
 
     deal_payload: dict = {
         "name": deal_name,
+        "status_id": DEAL_PIPELINE_STATUS_ID,
         "_embedded": {
             "companies": [{"id": company_id}],
         },
     }
 
     async with httpx.AsyncClient() as client:
-        # Создаём сделку
         resp = await client.post(
             f"{base_url}/leads",
             headers=_amo_headers(),
@@ -209,7 +202,6 @@ async def _create_deal(
         deal_id = resp.json()["_embedded"]["leads"][0]["id"]
         logger.info("Сделка создана: id=%s", deal_id)
 
-        # Добавляем примечание со всем текстом OCR
         note_payload = {
             "entity_id": deal_id,
             "note_type": "common",
@@ -221,7 +213,6 @@ async def _create_deal(
             json=[note_payload],
         )
 
-        # ФИО агента — кастомное поле компании
         if agent_name and COMPANY_FIELD_AGENT:
             await client.patch(
                 f"{base_url}/companies/{company_id}",
@@ -233,7 +224,6 @@ async def _create_deal(
                 },
             )
 
-    # Телефон — стандартное поле, выносим в отдельный метод
     if agent_phone:
         await _update_company_phone(company_id, agent_phone)
 
@@ -243,10 +233,6 @@ async def _create_deal(
 # ─── OCR через OpenAI Vision ─────────────────────────────────────────────────
 
 async def _ocr_photo(image_b64: str, mime: str, system_prompt: str) -> dict:
-    """
-    Отправляет фото в OpenAI Vision.
-    Возвращает dict с распознанными полями (JSON от GPT).
-    """
     import json
     client = get_openai_client()
     response = await client.chat.completions.create(
@@ -280,14 +266,19 @@ async def _ocr_photo(image_b64: str, mime: str, system_prompt: str) -> dict:
 
 # ─── ConversationHandler шаги ─────────────────────────────────────────────────
 
+async def handle_unknown(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Отвечает на любое сообщение вне активного сценария."""
+    await update.message.reply_text(
+        "🔑 Пришлите ваш уникальный код для начала работы."
+    )
+
+
 async def handle_code(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     text = update.message.text.strip()
     scenario = SCENARIOS.get(text)
     if not scenario:
         await update.message.reply_text(
-            f"❌ Неизвестный код сценария: <b>{text}</b>\n\n"
-            "Введите корректный код (например, <b>5800</b>).",
-            parse_mode=constants.ParseMode.HTML,
+            "🔑 Пришлите ваш уникальный код для начала работы."
         )
         return ConversationHandler.END
 
@@ -388,8 +379,7 @@ async def _push_to_amo(
         await message.reply_text(
             f"✅ <b>Готово!</b>\n\n"
             f"🏢 Компания: <b>{company_name}</b>\n"
-            f"📋 Сделка ID: <b>{deal_id}</b>\n"
-            f"🔗 <a href=\"https://{AMO_SUBDOMAIN}.amocrm.ru/leads/detail/{deal_id}\">Открыть в AmoCRM</a>",
+            f"📋 Сделка создана.",
             parse_mode=constants.ParseMode.HTML,
         )
     except Exception as exc:
@@ -407,12 +397,8 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    codes = ", ".join(f"<b>{k}</b>" for k in SCENARIOS)
     await update.message.reply_text(
-        "👋 Привет!\n\n"
-        f"Введите код сценария ({codes}) для начала работы.\n"
-        "Для отмены — /cancel",
-        parse_mode=constants.ParseMode.HTML,
+        "🔑 Пришлите ваш уникальный код для начала работы."
     )
 
 
@@ -453,6 +439,8 @@ def main() -> None:
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("cancel", cmd_cancel))
     app.add_handler(conv)
+    # Любое сообщение вне сценария — просим прислать код
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_unknown))
 
     logger.info("Бот запущен.")
     app.run_polling(allowed_updates=["message", "callback_query"])
