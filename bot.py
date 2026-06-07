@@ -9,6 +9,9 @@ import base64
 import logging
 import httpx
 from io import BytesIO
+from typing import Optional
+from dotenv import load_dotenv
+load_dotenv()
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, constants
 from telegram.ext import (
@@ -80,7 +83,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ─── OpenAI клиент ───────────────────────────────────────────────────────────
-openai_client: AsyncOpenAI | None = None
+openai_client: Optional[AsyncOpenAI] | None = None
 
 
 def get_openai_client() -> AsyncOpenAI:
