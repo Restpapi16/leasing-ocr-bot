@@ -36,8 +36,8 @@ AMO_ACCESS_TOKEN = os.getenv("AMO_ACCESS_TOKEN", "")       # Long-lived OAuth2 a
 
 # ─── ID кастомных полей AmoCRM (заполни сам!) ──────────────────────────────────
 # Поля КОМПАНИИ (custom fields)
-COMPANY_FIELD_INN   = 0   # TODO: вставь ID кастомного поля ИНН компании
-COMPANY_FIELD_AGENT = 0   # TODO: вставь ID кастомного поля ФИО агента компании
+COMPANY_FIELD_INN   = 711641   # TODO: вставь ID кастомного поля ИНН компании
+COMPANY_FIELD_AGENT = 711655   # TODO: вставь ID кастомного поля ФИО агента компании
 # Телефон — СТАНДАРТНОЕ поле AmoCRM, записывается через ключ "phone" в теле запроса
 
 # ─── Состояния ConversationHandler ───────────────────────────────────────────
