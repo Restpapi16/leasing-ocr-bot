@@ -28,25 +28,23 @@ OPENAI_API_KEY   = os.getenv("OPENAI_API_KEY", "")
 OPENAI_MODEL     = os.getenv("OPENAI_MODEL", "gpt-4o")
 
 # AmoCRM
-AMO_SUBDOMAIN    = os.getenv("AMO_SUBDOMAIN", "")          # yourcompany.amocrm.ru
+AMO_SUBDOMAIN    = os.getenv("AMO_SUBDOMAIN", "")          # yourcompany (без .amocrm.ru)
 AMO_ACCESS_TOKEN = os.getenv("AMO_ACCESS_TOKEN", "")       # Long-lived OAuth2 access token
 
-# ─── ID полей AmoCRM (заполни сам!) ──────────────────────────────────────────
-# Поля КОМПАНИИ (company custom fields)
-COMPANY_FIELD_INN   = 0   # TODO: вставь ID поля ИНН компании
-COMPANY_FIELD_PHONE = 0   # TODO: вставь ID поля телефона компании
-COMPANY_FIELD_AGENT = 0   # TODO: вставь ID поля ФИО агента компании
+# ─── ID кастомных полей AmoCRM (заполни сам!) ──────────────────────────────────
+# Поля КОМПАНИИ (custom fields)
+COMPANY_FIELD_INN   = 0   # TODO: вставь ID кастомного поля ИНН компании
+COMPANY_FIELD_AGENT = 0   # TODO: вставь ID кастомного поля ФИО агента компании
+# Телефон — СТАНДАРТНОЕ поле AmoCRM, записывается через ключ "phone" в теле запроса
 
 # ─── Состояния ConversationHandler ───────────────────────────────────────────
-WAIT_PHOTO    = 1
-WAIT_AGENT    = 2
+WAIT_PHOTO = 1
+WAIT_AGENT = 2
 
 # ─── Сценарии ─────────────────────────────────────────────────────────────────
-# Добавляй новые сценарии сюда по тому же паттерну
 SCENARIOS = {
     "5800": {
         "description": "РБ Лизинг — заявка от сети продаж",
-        # Промпт для GPT — что именно вытащить с фото
         "system_prompt": (
             "Ты — ассистент по обработке лизинговых заявок.\n"
             "С фото нужно извлечь СТРОГО следующие поля в формате JSON:\n"
@@ -123,7 +121,7 @@ async def _find_or_create_company(company_name: str, inn: str | None) -> int:
             if items:
                 company_id = items[0]["id"]
                 logger.info("Компания найдена: id=%s", company_id)
-                # Обновляем ИНН если есть
+                # Обновляем кастомное поле ИНН если есть
                 if inn and COMPANY_FIELD_INN:
                     await client.patch(
                         f"{base_url}/companies/{company_id}",
@@ -152,6 +150,27 @@ async def _find_or_create_company(company_name: str, inn: str | None) -> int:
         company_id = resp.json()["_embedded"]["companies"][0]["id"]
         logger.info("Компания создана: id=%s", company_id)
         return company_id
+
+
+async def _update_company_phone(company_id: int, phone: str) -> None:
+    """
+    Записывает телефон в СТАНДАРТНОЕ поле компании.
+    В AmoCRM это ключ "phone" верхнего уровня, а НЕ custom_fields_values.
+    """
+    base_url = f"https://{AMO_SUBDOMAIN}.amocrm.ru/api/v4"
+    payload = {
+        "phone": [
+            {"value": phone, "enum_code": "WORK"}
+        ]
+    }
+    async with httpx.AsyncClient() as client:
+        resp = await client.patch(
+            f"{base_url}/companies/{company_id}",
+            headers=_amo_headers(),
+            json=payload,
+        )
+        resp.raise_for_status()
+        logger.info("Телефон компании обновлён: %s", phone)
 
 
 async def _create_deal(
@@ -187,7 +206,7 @@ async def _create_deal(
         deal_id = resp.json()["_embedded"]["leads"][0]["id"]
         logger.info("Сделка создана: id=%s", deal_id)
 
-        # Добавляем примечание со ВСЕМ текстом OCR
+        # Добавляем примечание со всем текстом OCR
         note_payload = {
             "entity_id": deal_id,
             "note_type": "common",
@@ -199,22 +218,21 @@ async def _create_deal(
             json=[note_payload],
         )
 
-        # Обновляем поля компании: телефон агента и ФИО агента
-        company_fields = []
-        if agent_phone and COMPANY_FIELD_PHONE:
-            company_fields.append(
-                {"field_id": COMPANY_FIELD_PHONE, "values": [{"value": agent_phone}]}
-            )
+        # ФИО агента — кастомное поле компании
         if agent_name and COMPANY_FIELD_AGENT:
-            company_fields.append(
-                {"field_id": COMPANY_FIELD_AGENT, "values": [{"value": agent_name}]}
-            )
-        if company_fields:
             await client.patch(
                 f"{base_url}/companies/{company_id}",
                 headers=_amo_headers(),
-                json={"custom_fields_values": company_fields},
+                json={
+                    "custom_fields_values": [
+                        {"field_id": COMPANY_FIELD_AGENT, "values": [{"value": agent_name}]}
+                    ]
+                },
             )
+
+    # Телефон — стандартное поле, выносим в отдельный метод
+    if agent_phone:
+        await _update_company_phone(company_id, agent_phone)
 
     return deal_id
 
@@ -250,7 +268,6 @@ async def _ocr_photo(image_b64: str, mime: str, system_prompt: str) -> dict:
         temperature=0.1,
     )
     raw = response.choices[0].message.content.strip()
-    # GPT может обернуть в ```json ... ``` — чистим
     if raw.startswith("```"):
         raw = raw.split("```")[1]
         if raw.startswith("json"):
@@ -261,7 +278,6 @@ async def _ocr_photo(image_b64: str, mime: str, system_prompt: str) -> dict:
 # ─── ConversationHandler шаги ─────────────────────────────────────────────────
 
 async def handle_code(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Шаг 1: пользователь ввёл код сценария."""
     text = update.message.text.strip()
     scenario = SCENARIOS.get(text)
     if not scenario:
@@ -274,7 +290,6 @@ async def handle_code(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
 
     context.user_data["scenario_code"] = text
     context.user_data["scenario"] = scenario
-
     await update.message.reply_text(
         f"✅ Сценарий <b>{text}</b>: {scenario['description']}\n\n"
         "📸 Отправьте фото документа.",
@@ -284,10 +299,7 @@ async def handle_code(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
 
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Шаг 2: пользователь прислал фото."""
     message = update.message
-
-    # Получаем фото (сжатое Telegram) или документ-картинку
     if message.photo:
         photo = message.photo[-1]
         file_obj = await context.bot.get_file(photo.file_id)
@@ -300,7 +312,6 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         return WAIT_PHOTO
 
     status_msg = await message.reply_text("⏳ Распознаю текст…")
-
     buf = BytesIO()
     await file_obj.download_to_memory(buf)
     image_b64 = base64.b64encode(buf.getvalue()).decode()
@@ -317,7 +328,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     await status_msg.delete()
 
     company_name = ocr_data.get("company_name") or "—"
-    inn          = ocr_data.get("inn") or "—"
+    inn = ocr_data.get("inn") or "—"
 
     await message.reply_text(
         f"🔍 Распознано:\n"
@@ -335,7 +346,6 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
 
 
 async def handle_agent_no(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Шаг 3а: нажата кнопка 'Нет' — агента нет."""
     await update.callback_query.answer()
     await update.callback_query.edit_message_reply_markup(reply_markup=None)
     await update.callback_query.message.reply_text("👌 Агент не указан. Создаю запись в AmoCRM…")
@@ -343,12 +353,10 @@ async def handle_agent_no(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 
 async def handle_agent_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Шаг 3б: пользователь ввёл телефон и ФИО."""
     text = update.message.text.strip()
-    parts = text.split(None, 1)  # первое слово — телефон, остальное — ФИО
+    parts = text.split(None, 1)
     phone = parts[0] if parts else None
-    name  = parts[1] if len(parts) > 1 else None
-
+    name = parts[1] if len(parts) > 1 else None
     await update.message.reply_text("👌 Данные получены. Создаю запись в AmoCRM…")
     return await _push_to_amo(update.message, context, phone=phone, name=name)
 
@@ -359,15 +367,14 @@ async def _push_to_amo(
     phone: str | None,
     name: str | None,
 ) -> int:
-    """Финальный шаг: создаём компанию и сделку в AmoCRM."""
     ocr_data = context.user_data.get("ocr_data", {})
     company_name = ocr_data.get("company_name") or "Без названия"
-    inn          = ocr_data.get("inn")
-    full_text    = ocr_data.get("full_text") or str(ocr_data)
+    inn = ocr_data.get("inn")
+    full_text = ocr_data.get("full_text") or str(ocr_data)
 
     try:
         company_id = await _find_or_create_company(company_name, inn)
-        deal_id    = await _create_deal(
+        deal_id = await _create_deal(
             deal_name=company_name,
             company_id=company_id,
             full_text=full_text,
@@ -420,7 +427,6 @@ def main() -> None:
 
     app = Application.builder().token(TELEGRAM_TOKEN).build()
 
-    # Сценарный диалог
     conv = ConversationHandler(
         entry_points=[
             MessageHandler(
