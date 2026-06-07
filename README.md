@@ -15,7 +15,7 @@ cd leasing-ocr-bot
 
 ### 2. Установить зависимости
 ```bash
-pip install -r requirements.txt
+y
 ```
 
 ### 3. Настроить переменные окружения

@@ -8,6 +8,9 @@ import os
 import base64
 import logging
 from io import BytesIO
+from typing import Optional
+from dotenv import load_dotenv
+load_dotenv()
 
 from telegram import Update, constants
 from telegram.ext import (
@@ -53,7 +56,7 @@ SYSTEM_PROMPT = """Ты — ассистент, специализирующий
 USER_PROMPT = "Распознай и передай полный текст письма с изображения."
 
 # ─── Клиент OpenAI ───────────────────────────────────────────────────────────
-openai_client: AsyncOpenAI | None = None
+openai_client: Optional[AsyncOpenAI] = None
 
 
 def get_openai_client() -> AsyncOpenAI:
