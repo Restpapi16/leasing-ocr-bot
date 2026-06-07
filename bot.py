@@ -83,7 +83,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ─── OpenAI клиент ───────────────────────────────────────────────────────────
-openai_client: Optional[AsyncOpenAI] | None = None
+openai_client: Optional[AsyncOpenAI] = None
 
 
 def get_openai_client() -> AsyncOpenAI:
@@ -104,7 +104,7 @@ def _amo_headers() -> dict:
     }
 
 
-async def _find_or_create_company(company_name: str, inn: str | None) -> int:
+async def _find_or_create_company(company_name: str, inn: Optional[str]) -> int:
     """
     Ищет компанию по названию. Если не найдена — создаёт.
     Возвращает ID компании в AmoCRM.
@@ -180,9 +180,9 @@ async def _create_deal(
     deal_name: str,
     company_id: int,
     full_text: str,
-    agent_phone: str | None,
-    agent_name: str | None,
-    inn: str | None,
+    agent_phone: Optional[str],
+    agent_name: Optional[str],
+    inn: Optional[str],
 ) -> int:
     """
     Создаёт сделку в AmoCRM и привязывает компанию.
@@ -367,8 +367,8 @@ async def handle_agent_text(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 async def _push_to_amo(
     message,
     context: ContextTypes.DEFAULT_TYPE,
-    phone: str | None,
-    name: str | None,
+    phone: Optional[str],
+    name: Optional[str],
 ) -> int:
     ocr_data = context.user_data.get("ocr_data", {})
     company_name = ocr_data.get("company_name") or "Без названия"
