@@ -42,6 +42,9 @@ COMPANY_FIELD_AGENT = 711655   # ID кастомного поля ФИО аге�
 # ID этапа воронки, на котором создаётся сделка
 DEAL_PIPELINE_STATUS_ID = 70009922
 
+# Тег, проставляемый каждой сделке
+DEAL_TAG = "Лизинг_OCR"
+
 # ─── Состояния ConversationHandler ───────────────────────────────────────────
 WAIT_PHOTO = 1
 WAIT_AGENT = 2
@@ -109,8 +112,7 @@ def _amo_headers() -> dict:
 async def _find_or_create_company(company_name: str, inn: Optional[str]) -> int:
     """
     Ищет компанию по названию. Если не найдена — создаёт.
-    Возвращает ID компании в AmoCRM.
-    Контакт НЕ создаётся (по ТЗ).
+    Возвращает ID компании в AmoCRM. Контакт НЕ создаётся.
     """
     base_url = f"https://{AMO_SUBDOMAIN}.amocrm.ru/api/v4"
 
@@ -178,9 +180,9 @@ async def _create_deal(
     inn: Optional[str],
 ) -> int:
     """
-    Создаёт сделку в AmoCRM на этапе DEAL_PIPELINE_STATUS_ID и привязывает компанию.
-    Весь текст OCR идёт в примечание сделки.
-    Возвращает ID созданной сделки.
+    Создаёт сделку в AmoCRM на этапе DEAL_PIPELINE_STATUS_ID,
+    привязывает компанию и ставит тег DEAL_TAG.
+    Весь текст OCR идёт в примечание.
     """
     base_url = f"https://{AMO_SUBDOMAIN}.amocrm.ru/api/v4"
 
@@ -189,6 +191,7 @@ async def _create_deal(
         "status_id": DEAL_PIPELINE_STATUS_ID,
         "_embedded": {
             "companies": [{"id": company_id}],
+            "tags": [{"name": DEAL_TAG}],
         },
     }
 
@@ -200,7 +203,7 @@ async def _create_deal(
         )
         resp.raise_for_status()
         deal_id = resp.json()["_embedded"]["leads"][0]["id"]
-        logger.info("Сделка создана: id=%s", deal_id)
+        logger.info("Сделка создана (id=%s) с тегом '%s'", deal_id, DEAL_TAG)
 
         note_payload = {
             "entity_id": deal_id,
