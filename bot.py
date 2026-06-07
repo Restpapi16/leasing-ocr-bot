@@ -1,28 +1,78 @@
 #!/usr/bin/env python3
 """
-Telegram-бот для OCR писем по лизинговым заявкам.
-Принимает фото письма → извлекает текст через OpenAI Vision API → отвечает текстом.
+Telegram-бот для OCR писем по лизинговым заявкам + интеграция с AmoCRM.
+Сценарии запускаются по коду (например, 5800).
 """
 
 import os
 import base64
 import logging
+import httpx
 from io import BytesIO
 
-from telegram import Update, constants
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, constants
 from telegram.ext import (
     Application,
     CommandHandler,
     MessageHandler,
+    CallbackQueryHandler,
+    ConversationHandler,
     filters,
     ContextTypes,
 )
 from openai import AsyncOpenAI
 
 # ─── Конфигурация ────────────────────────────────────────────────────────────
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-OPENAI_MODEL   = os.getenv("OPENAI_MODEL", "gpt-4o")  # модель с поддержкой Vision
+TELEGRAM_TOKEN   = os.getenv("TELEGRAM_TOKEN", "")
+OPENAI_API_KEY   = os.getenv("OPENAI_API_KEY", "")
+OPENAI_MODEL     = os.getenv("OPENAI_MODEL", "gpt-4o")
+
+# AmoCRM
+AMO_SUBDOMAIN    = os.getenv("AMO_SUBDOMAIN", "")          # yourcompany.amocrm.ru
+AMO_ACCESS_TOKEN = os.getenv("AMO_ACCESS_TOKEN", "")       # Long-lived OAuth2 access token
+
+# ─── ID полей AmoCRM (заполни сам!) ──────────────────────────────────────────
+# Поля КОМПАНИИ (company custom fields)
+COMPANY_FIELD_INN   = 0   # TODO: вставь ID поля ИНН компании
+COMPANY_FIELD_PHONE = 0   # TODO: вставь ID поля телефона компании
+COMPANY_FIELD_AGENT = 0   # TODO: вставь ID поля ФИО агента компании
+
+# ─── Состояния ConversationHandler ───────────────────────────────────────────
+WAIT_PHOTO    = 1
+WAIT_AGENT    = 2
+
+# ─── Сценарии ─────────────────────────────────────────────────────────────────
+# Добавляй новые сценарии сюда по тому же паттерну
+SCENARIOS = {
+    "5800": {
+        "description": "РБ Лизинг — заявка от сети продаж",
+        # Промпт для GPT — что именно вытащить с фото
+        "system_prompt": (
+            "Ты — ассистент по обработке лизинговых заявок.\n"
+            "С фото нужно извлечь СТРОГО следующие поля в формате JSON:\n"
+            "{\n"
+            '  "company_name": "Наименование клиента",\n'
+            '  "inn": "ИНН клиента",\n'
+            '  "activity": "Основной вид деятельности",\n'
+            '  "revenue_segment": "Выручка в млн руб. / Сегмент",\n'
+            '  "leasing_type": "Вид лизинга",\n'
+            '  "leasing_subject": "Предмет лизинга",\n'
+            '  "cost": "Стоимость",\n'
+            '  "term_months": "Срок лизинга в мес",\n'
+            '  "advance_pct": "Аванс лизингополучателя в %",\n'
+            '  "payment_type": "Тип платежей",\n'
+            '  "full_text": "ВЕСЬ текст с фото дословно"\n'
+            "}\n\n"
+            "Если поле не найдено — ставь null.\n"
+            "Отвечай ТОЛЬКО валидным JSON, без markdown-блоков."
+        ),
+    },
+    # Пример добавления нового сценария:
+    # "1234": {
+    #     "description": "Другой сценарий",
+    #     "system_prompt": "...",
+    # },
+}
 
 # ─── Логирование ─────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -31,28 +81,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ─── Промпт для анализа ──────────────────────────────────────────────────────
-SYSTEM_PROMPT = """Ты — ассистент, специализирующийся на обработке деловой корреспонденции,
-связанной с лизинговыми заявками.
-
-Твоя задача:
-1. Полностью и точно распознать весь текст письма на изображении.
-2. Сохранить оригинальную структуру документа: заголовки, абзацы, таблицы, реквизиты.
-3. Выделить ключевые реквизиты лизинга, если они присутствуют:
-   - Номер и дата заявки
-   - Лизингополучатель / лизингодатель
-   - Предмет лизинга (марка, модель, VIN / серийный номер)
-   - Стоимость и валюта
-   - Срок лизинга
-   - Аванс, остаточная стоимость, ставка удорожания
-4. Если изображение нечёткое или текст частично нечитаем — укажи это явно.
-5. Отвечай строго на русском языке.
-
-Сначала выведи раздел «📄 РАСПОЗНАННЫЙ ТЕКСТ:», а затем раздел «📋 КЛЮЧЕВЫЕ РЕКВИЗИТЫ:»."""
-
-USER_PROMPT = "Распознай и передай полный текст письма с изображения."
-
-# ─── Клиент OpenAI ───────────────────────────────────────────────────────────
+# ─── OpenAI клиент ───────────────────────────────────────────────────────────
 openai_client: AsyncOpenAI | None = None
 
 
@@ -65,205 +94,359 @@ def get_openai_client() -> AsyncOpenAI:
     return openai_client
 
 
-# ─── Handlers ────────────────────────────────────────────────────────────────
+# ─── AmoCRM helpers ───────────────────────────────────────────────────────────
+
+def _amo_headers() -> dict:
+    return {
+        "Authorization": f"Bearer {AMO_ACCESS_TOKEN}",
+        "Content-Type": "application/json",
+    }
+
+
+async def _find_or_create_company(company_name: str, inn: str | None) -> int:
+    """
+    Ищет компанию по названию. Если не найдена — создаёт.
+    Возвращает ID компании в AmoCRM.
+    Контакт НЕ создаётся (по ТЗ).
+    """
+    base_url = f"https://{AMO_SUBDOMAIN}.amocrm.ru/api/v4"
+
+    async with httpx.AsyncClient() as client:
+        # Поиск по названию
+        resp = await client.get(
+            f"{base_url}/companies",
+            headers=_amo_headers(),
+            params={"query": company_name, "limit": 5},
+        )
+        if resp.status_code == 200:
+            items = resp.json().get("_embedded", {}).get("companies", [])
+            if items:
+                company_id = items[0]["id"]
+                logger.info("Компания найдена: id=%s", company_id)
+                # Обновляем ИНН если есть
+                if inn and COMPANY_FIELD_INN:
+                    await client.patch(
+                        f"{base_url}/companies/{company_id}",
+                        headers=_amo_headers(),
+                        json={
+                            "custom_fields_values": [
+                                {"field_id": COMPANY_FIELD_INN, "values": [{"value": inn}]}
+                            ]
+                        },
+                    )
+                return company_id
+
+        # Компания не найдена — создаём
+        payload: dict = {"name": company_name}
+        if inn and COMPANY_FIELD_INN:
+            payload["custom_fields_values"] = [
+                {"field_id": COMPANY_FIELD_INN, "values": [{"value": inn}]}
+            ]
+
+        resp = await client.post(
+            f"{base_url}/companies",
+            headers=_amo_headers(),
+            json=[payload],
+        )
+        resp.raise_for_status()
+        company_id = resp.json()["_embedded"]["companies"][0]["id"]
+        logger.info("Компания создана: id=%s", company_id)
+        return company_id
+
+
+async def _create_deal(
+    deal_name: str,
+    company_id: int,
+    full_text: str,
+    agent_phone: str | None,
+    agent_name: str | None,
+    inn: str | None,
+) -> int:
+    """
+    Создаёт сделку в AmoCRM и привязывает компанию.
+    Весь текст OCR идёт в примечание сделки.
+    Возвращает ID созданной сделки.
+    """
+    base_url = f"https://{AMO_SUBDOMAIN}.amocrm.ru/api/v4"
+
+    deal_payload: dict = {
+        "name": deal_name,
+        "_embedded": {
+            "companies": [{"id": company_id}],
+        },
+    }
+
+    async with httpx.AsyncClient() as client:
+        # Создаём сделку
+        resp = await client.post(
+            f"{base_url}/leads",
+            headers=_amo_headers(),
+            json=[deal_payload],
+        )
+        resp.raise_for_status()
+        deal_id = resp.json()["_embedded"]["leads"][0]["id"]
+        logger.info("Сделка создана: id=%s", deal_id)
+
+        # Добавляем примечание со ВСЕМ текстом OCR
+        note_payload = {
+            "entity_id": deal_id,
+            "note_type": "common",
+            "params": {"text": f"📄 OCR-текст с фото:\n\n{full_text}"},
+        }
+        await client.post(
+            f"{base_url}/leads/notes",
+            headers=_amo_headers(),
+            json=[note_payload],
+        )
+
+        # Обновляем поля компании: телефон агента и ФИО агента
+        company_fields = []
+        if agent_phone and COMPANY_FIELD_PHONE:
+            company_fields.append(
+                {"field_id": COMPANY_FIELD_PHONE, "values": [{"value": agent_phone}]}
+            )
+        if agent_name and COMPANY_FIELD_AGENT:
+            company_fields.append(
+                {"field_id": COMPANY_FIELD_AGENT, "values": [{"value": agent_name}]}
+            )
+        if company_fields:
+            await client.patch(
+                f"{base_url}/companies/{company_id}",
+                headers=_amo_headers(),
+                json={"custom_fields_values": company_fields},
+            )
+
+    return deal_id
+
+
+# ─── OCR через OpenAI Vision ─────────────────────────────────────────────────
+
+async def _ocr_photo(image_b64: str, mime: str, system_prompt: str) -> dict:
+    """
+    Отправляет фото в OpenAI Vision.
+    Возвращает dict с распознанными полями (JSON от GPT).
+    """
+    import json
+    client = get_openai_client()
+    response = await client.chat.completions.create(
+        model=OPENAI_MODEL,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:{mime};base64,{image_b64}",
+                            "detail": "high",
+                        },
+                    },
+                    {"type": "text", "text": "Распознай поля по инструкции."},
+                ],
+            },
+        ],
+        max_tokens=4096,
+        temperature=0.1,
+    )
+    raw = response.choices[0].message.content.strip()
+    # GPT может обернуть в ```json ... ``` — чистим
+    if raw.startswith("```"):
+        raw = raw.split("```")[1]
+        if raw.startswith("json"):
+            raw = raw[4:]
+    return json.loads(raw)
+
+
+# ─── ConversationHandler шаги ─────────────────────────────────────────────────
+
+async def handle_code(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Шаг 1: пользователь ввёл код сценария."""
+    text = update.message.text.strip()
+    scenario = SCENARIOS.get(text)
+    if not scenario:
+        await update.message.reply_text(
+            f"❌ Неизвестный код сценария: <b>{text}</b>\n\n"
+            "Введите корректный код (например, <b>5800</b>).",
+            parse_mode=constants.ParseMode.HTML,
+        )
+        return ConversationHandler.END
+
+    context.user_data["scenario_code"] = text
+    context.user_data["scenario"] = scenario
+
+    await update.message.reply_text(
+        f"✅ Сценарий <b>{text}</b>: {scenario['description']}\n\n"
+        "📸 Отправьте фото документа.",
+        parse_mode=constants.ParseMode.HTML,
+    )
+    return WAIT_PHOTO
+
+
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Шаг 2: пользователь прислал фото."""
+    message = update.message
+
+    # Получаем фото (сжатое Telegram) или документ-картинку
+    if message.photo:
+        photo = message.photo[-1]
+        file_obj = await context.bot.get_file(photo.file_id)
+        mime = "image/jpeg"
+    elif message.document and message.document.mime_type.startswith("image/"):
+        file_obj = await context.bot.get_file(message.document.file_id)
+        mime = message.document.mime_type
+    else:
+        await message.reply_text("⚠️ Пожалуйста, отправьте фото.")
+        return WAIT_PHOTO
+
+    status_msg = await message.reply_text("⏳ Распознаю текст…")
+
+    buf = BytesIO()
+    await file_obj.download_to_memory(buf)
+    image_b64 = base64.b64encode(buf.getvalue()).decode()
+
+    scenario = context.user_data["scenario"]
+    try:
+        ocr_data = await _ocr_photo(image_b64, mime, scenario["system_prompt"])
+    except Exception as exc:
+        logger.exception("Ошибка OCR")
+        await status_msg.edit_text(f"❌ Ошибка распознавания: {exc}")
+        return ConversationHandler.END
+
+    context.user_data["ocr_data"] = ocr_data
+    await status_msg.delete()
+
+    company_name = ocr_data.get("company_name") or "—"
+    inn          = ocr_data.get("inn") or "—"
+
+    await message.reply_text(
+        f"🔍 Распознано:\n"
+        f"• <b>Компания:</b> {company_name}\n"
+        f"• <b>ИНН:</b> {inn}\n\n"
+        "❓ <b>Имеется ли номер телефона и ФИО агента?</b>\n\n"
+        "Нажмите <b>Нет</b> или напишите данные в формате:\n"
+        "<code>+79001234567 Иванов Иван Иванович</code>",
+        parse_mode=constants.ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("Нет", callback_data="agent_no")]
+        ]),
+    )
+    return WAIT_AGENT
+
+
+async def handle_agent_no(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Шаг 3а: нажата кнопка 'Нет' — агента нет."""
+    await update.callback_query.answer()
+    await update.callback_query.edit_message_reply_markup(reply_markup=None)
+    await update.callback_query.message.reply_text("👌 Агент не указан. Создаю запись в AmoCRM…")
+    return await _push_to_amo(update.callback_query.message, context, phone=None, name=None)
+
+
+async def handle_agent_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Шаг 3б: пользователь ввёл телефон и ФИО."""
+    text = update.message.text.strip()
+    parts = text.split(None, 1)  # первое слово — телефон, остальное — ФИО
+    phone = parts[0] if parts else None
+    name  = parts[1] if len(parts) > 1 else None
+
+    await update.message.reply_text("👌 Данные получены. Создаю запись в AmoCRM…")
+    return await _push_to_amo(update.message, context, phone=phone, name=name)
+
+
+async def _push_to_amo(
+    message,
+    context: ContextTypes.DEFAULT_TYPE,
+    phone: str | None,
+    name: str | None,
+) -> int:
+    """Финальный шаг: создаём компанию и сделку в AmoCRM."""
+    ocr_data = context.user_data.get("ocr_data", {})
+    company_name = ocr_data.get("company_name") or "Без названия"
+    inn          = ocr_data.get("inn")
+    full_text    = ocr_data.get("full_text") or str(ocr_data)
+
+    try:
+        company_id = await _find_or_create_company(company_name, inn)
+        deal_id    = await _create_deal(
+            deal_name=company_name,
+            company_id=company_id,
+            full_text=full_text,
+            agent_phone=phone,
+            agent_name=name,
+            inn=inn,
+        )
+        await message.reply_text(
+            f"✅ <b>Готово!</b>\n\n"
+            f"🏢 Компания: <b>{company_name}</b>\n"
+            f"📋 Сделка ID: <b>{deal_id}</b>\n"
+            f"🔗 <a href=\"https://{AMO_SUBDOMAIN}.amocrm.ru/leads/detail/{deal_id}\">Открыть в AmoCRM</a>",
+            parse_mode=constants.ParseMode.HTML,
+        )
+    except Exception as exc:
+        logger.exception("Ошибка при отправке в AmoCRM")
+        await message.reply_text(f"❌ Ошибка AmoCRM: {exc}")
+
+    context.user_data.clear()
+    return ConversationHandler.END
+
+
+async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.user_data.clear()
+    await update.message.reply_text("🚫 Операция отменена.")
+    return ConversationHandler.END
+
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Приветственное сообщение."""
+    codes = ", ".join(f"<b>{k}</b>" for k in SCENARIOS)
     await update.message.reply_text(
         "👋 Привет!\n\n"
-        "Отправьте мне *фото письма* по лизинговой заявке — я распознаю текст "
-        "и выделю ключевые реквизиты.\n\n"
-        "📌 *Советы для точного результата:*\n"
-        "• Снимайте при хорошем освещении\n"
-        "• Держите камеру ровно над документом\n"
-        "• Избегайте бликов и теней",
-        parse_mode=constants.ParseMode.MARKDOWN,
+        f"Введите код сценария ({codes}) для начала работы.\n"
+        "Для отмены — /cancel",
+        parse_mode=constants.ParseMode.HTML,
     )
-
-
-async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text(
-        "ℹ️ *Как пользоваться ботом:*\n\n"
-        "1. Сфотографируйте письмо по лизинговой заявке.\n"
-        "2. Отправьте фото в этот чат.\n"
-        "3. Получите распознанный текст и ключевые реквизиты.\n\n"
-        "🔒 Изображения не сохраняются. Обработка — через OpenAI Vision API.",
-        parse_mode=constants.ParseMode.MARKDOWN,
-    )
-
-
-async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Основной обработчик фото."""
-    message = update.message
-    await message.reply_chat_action(constants.ChatAction.TYPING)
-
-    # Берём фото наивысшего разрешения
-    photo = message.photo[-1]
-    logger.info("Получено фото: file_id=%s, size=%dx%d", photo.file_id, photo.width, photo.height)
-
-    # Уведомляем пользователя
-    status_msg = await message.reply_text("⏳ Распознаю текст письма…")
-
-    try:
-        # Скачиваем файл
-        file = await context.bot.get_file(photo.file_id)
-        buf = BytesIO()
-        await file.download_to_memory(buf)
-        image_b64 = base64.b64encode(buf.getvalue()).decode()
-
-        # Запрос к OpenAI Vision
-        client = get_openai_client()
-        response = await client.chat.completions.create(
-            model=OPENAI_MODEL,
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "image_url",
-                            "image_url": {
-                                "url": f"data:image/jpeg;base64,{image_b64}",
-                                "detail": "high",
-                            },
-                        },
-                        {"type": "text", "text": USER_PROMPT},
-                    ],
-                },
-            ],
-            max_tokens=4096,
-            temperature=0.1,
-        )
-
-        result_text = response.choices[0].message.content.strip()
-        logger.info("Ответ OpenAI получен, длина: %d символов", len(result_text))
-
-        await status_msg.delete()
-        await _send_long_message(message, result_text)
-
-    except Exception as exc:
-        logger.exception("Ошибка при обработке фото")
-        await status_msg.edit_text(
-            f"❌ Произошла ошибка при обработке изображения:\n`{exc}`\n\n"
-            "Попробуйте ещё раз или проверьте настройки бота.",
-            parse_mode=constants.ParseMode.MARKDOWN,
-        )
-
-
-async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Обработчик документов (фото, отправленное как файл)."""
-    doc = update.message.document
-    if not doc.mime_type or not doc.mime_type.startswith("image/"):
-        await update.message.reply_text(
-            "⚠️ Пожалуйста, отправьте изображение (фото или файл-картинку)."
-        )
-        return
-
-    await update.message.reply_chat_action(constants.ChatAction.TYPING)
-    status_msg = await update.message.reply_text("⏳ Распознаю текст письма…")
-
-    try:
-        file = await context.bot.get_file(doc.file_id)
-        buf = BytesIO()
-        await file.download_to_memory(buf)
-        image_b64 = base64.b64encode(buf.getvalue()).decode()
-
-        mime = doc.mime_type
-        client = get_openai_client()
-        response = await client.chat.completions.create(
-            model=OPENAI_MODEL,
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "image_url",
-                            "image_url": {
-                                "url": f"data:{mime};base64,{image_b64}",
-                                "detail": "high",
-                            },
-                        },
-                        {"type": "text", "text": USER_PROMPT},
-                    ],
-                },
-            ],
-            max_tokens=4096,
-            temperature=0.1,
-        )
-
-        result_text = response.choices[0].message.content.strip()
-        await status_msg.delete()
-        await _send_long_message(update.message, result_text)
-
-    except Exception as exc:
-        logger.exception("Ошибка при обработке документа")
-        await status_msg.edit_text(
-            f"❌ Ошибка: `{exc}`",
-            parse_mode=constants.ParseMode.MARKDOWN,
-        )
-
-
-async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Ответ на любой текст (не фото)."""
-    await update.message.reply_text(
-        "📸 Отправьте, пожалуйста, *фото письма* по лизинговой заявке.",
-        parse_mode=constants.ParseMode.MARKDOWN,
-    )
-
-
-# ─── Утилиты ─────────────────────────────────────────────────────────────────
-
-async def _send_long_message(message, text: str) -> None:
-    """Разбивает длинный текст на части <= 4096 символов."""
-    LIMIT = 4000
-    if len(text) <= LIMIT:
-        await message.reply_text(text)
-        return
-
-    parts = []
-    while text:
-        if len(text) <= LIMIT:
-            parts.append(text)
-            break
-        split_at = text.rfind("\n\n", 0, LIMIT)
-        if split_at == -1:
-            split_at = text.rfind("\n", 0, LIMIT)
-        if split_at == -1:
-            split_at = LIMIT
-        parts.append(text[:split_at])
-        text = text[split_at:].lstrip()
-
-    for i, part in enumerate(parts, 1):
-        prefix = f"[Часть {i}/{len(parts)}]\n" if len(parts) > 1 else ""
-        await message.reply_text(prefix + part)
 
 
 # ─── Запуск ───────────────────────────────────────────────────────────────────
 
 def main() -> None:
     if not TELEGRAM_TOKEN:
-        raise RuntimeError(
-            "Переменная окружения TELEGRAM_TOKEN не задана.\n"
-            "Создайте бота через @BotFather и задайте токен."
-        )
+        raise RuntimeError("TELEGRAM_TOKEN не задан.")
     if not OPENAI_API_KEY:
-        raise RuntimeError(
-            "Переменная окружения OPENAI_API_KEY не задана."
-        )
+        raise RuntimeError("OPENAI_API_KEY не задан.")
+    if not AMO_SUBDOMAIN or not AMO_ACCESS_TOKEN:
+        raise RuntimeError("AMO_SUBDOMAIN / AMO_ACCESS_TOKEN не заданы.")
 
     logger.info("Запуск бота (модель: %s)…", OPENAI_MODEL)
 
     app = Application.builder().token(TELEGRAM_TOKEN).build()
 
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("help", cmd_help))
-    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
-    app.add_handler(MessageHandler(filters.Document.IMAGE, handle_document))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    # Сценарный диалог
+    conv = ConversationHandler(
+        entry_points=[
+            MessageHandler(
+                filters.TEXT & ~filters.COMMAND & filters.Regex(r"^\d{4,6}$"),
+                handle_code,
+            )
+        ],
+        states={
+            WAIT_PHOTO: [
+                MessageHandler(filters.PHOTO | filters.Document.IMAGE, handle_photo)
+            ],
+            WAIT_AGENT: [
+                CallbackQueryHandler(handle_agent_no, pattern="^agent_no$"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_agent_text),
+            ],
+        },
+        fallbacks=[CommandHandler("cancel", cmd_cancel)],
+        conversation_timeout=600,
+    )
 
-    logger.info("Бот запущен. Ожидаю сообщений…")
-    app.run_polling(allowed_updates=["message"])
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("cancel", cmd_cancel))
+    app.add_handler(conv)
+
+    logger.info("Бот запущен.")
+    app.run_polling(allowed_updates=["message", "callback_query"])
 
 
 if __name__ == "__main__":
