@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Telegram-бот для OCR писем по лизинговым заявкам + интеграция с AmoCRM.
+Telegram-бот для OCR лизинговых заявок + интеграция с AmoCRM.
 Сценарии запускаются по коду (например, 5800).
 """
 
@@ -30,24 +30,24 @@ TELEGRAM_TOKEN   = os.getenv("TELEGRAM_TOKEN", "")
 OPENAI_API_KEY   = os.getenv("OPENAI_API_KEY", "")
 OPENAI_MODEL     = os.getenv("OPENAI_MODEL", "gpt-4o")
 
-# AmoCRM
-AMO_SUBDOMAIN    = os.getenv("AMO_SUBDOMAIN", "")          # yourcompany (без .amocrm.ru)
-AMO_ACCESS_TOKEN = os.getenv("AMO_ACCESS_TOKEN", "")       # Long-lived OAuth2 access token
+AMO_SUBDOMAIN    = os.getenv("AMO_SUBDOMAIN", "")
+AMO_ACCESS_TOKEN = os.getenv("AMO_ACCESS_TOKEN", "")
 
-# ─── ID кастомных полей AmoCRM ───────────────────────────────────────────────
-COMPANY_FIELD_INN   = 711641   # ID кастомного поля ИНН компании
-COMPANY_FIELD_AGENT = 711655   # ID кастомного поля ФИО агента компании
-# Телефон — СТАНДАРТНОЕ поле AmoCRM, записывается через ключ "phone"
+# ─── ID полей AmoCRM ─────────────────────────────────────────────────────────
+COMPANY_FIELD_INN   = 711641
+COMPANY_FIELD_AGENT = 711655
 
-# ID этапа воронки, на котором создаётся сделка
 DEAL_PIPELINE_STATUS_ID = 70009922
-
-# Тег, проставляемый каждой сделке
 DEAL_TAG = "Лизинг_OCR"
 
-# ─── Состояния ConversationHandler ───────────────────────────────────────────
-WAIT_PHOTO = 1
-WAIT_AGENT = 2
+# ─── Состояния диалога ───────────────────────────────────────────────────────
+(
+    WAIT_PHOTO,
+    WAIT_AGENT_CHOICE,   # есть ли агент?
+    WAIT_PHONE,          # ввод телефона
+    WAIT_NAME,           # ввод ФИО
+    WAIT_CONFIRM,        # подтверждение данных
+) = range(5)
 
 # ─── Сценарии ─────────────────────────────────────────────────────────────────
 SCENARIOS = {
@@ -73,11 +73,6 @@ SCENARIOS = {
             "Отвечай ТОЛЬКО валидным JSON, без markdown-блоков."
         ),
     },
-    # Пример добавления нового сценария:
-    # "1234": {
-    #     "description": "Другой сценарий",
-    #     "system_prompt": "...",
-    # },
 }
 
 # ─── Логирование ─────────────────────────────────────────────────────────────
@@ -87,9 +82,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ─── OpenAI клиент ───────────────────────────────────────────────────────────
+# ─── OpenAI ──────────────────────────────────────────────────────────────────
 openai_client: Optional[AsyncOpenAI] = None
-
 
 def get_openai_client() -> AsyncOpenAI:
     global openai_client
@@ -99,7 +93,6 @@ def get_openai_client() -> AsyncOpenAI:
         openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
     return openai_client
 
-
 # ─── AmoCRM helpers ───────────────────────────────────────────────────────────
 
 def _amo_headers() -> dict:
@@ -108,14 +101,8 @@ def _amo_headers() -> dict:
         "Content-Type": "application/json",
     }
 
-
 async def _find_or_create_company(company_name: str, inn: Optional[str]) -> int:
-    """
-    Ищет компанию по названию. Если не найдена — создаёт.
-    Возвращает ID компании в AmoCRM. Контакт НЕ создаётся.
-    """
     base_url = f"https://{AMO_SUBDOMAIN}.amocrm.ru/api/v4"
-
     async with httpx.AsyncClient() as client:
         resp = await client.get(
             f"{base_url}/companies",
@@ -131,11 +118,9 @@ async def _find_or_create_company(company_name: str, inn: Optional[str]) -> int:
                     await client.patch(
                         f"{base_url}/companies/{company_id}",
                         headers=_amo_headers(),
-                        json={
-                            "custom_fields_values": [
-                                {"field_id": COMPANY_FIELD_INN, "values": [{"value": inn}]}
-                            ]
-                        },
+                        json={"custom_fields_values": [
+                            {"field_id": COMPANY_FIELD_INN, "values": [{"value": inn}]}
+                        ]},
                     )
                 return company_id
 
@@ -144,7 +129,6 @@ async def _find_or_create_company(company_name: str, inn: Optional[str]) -> int:
             payload["custom_fields_values"] = [
                 {"field_id": COMPANY_FIELD_INN, "values": [{"value": inn}]}
             ]
-
         resp = await client.post(
             f"{base_url}/companies",
             headers=_amo_headers(),
@@ -155,11 +139,7 @@ async def _find_or_create_company(company_name: str, inn: Optional[str]) -> int:
         logger.info("Компания создана: id=%s", company_id)
         return company_id
 
-
 async def _update_company_phone(company_id: int, phone: str) -> None:
-    """
-    Записывает телефон в СТАНДАРТНОЕ поле компании.
-    """
     base_url = f"https://{AMO_SUBDOMAIN}.amocrm.ru/api/v4"
     async with httpx.AsyncClient() as client:
         resp = await client.patch(
@@ -168,8 +148,6 @@ async def _update_company_phone(company_id: int, phone: str) -> None:
             json={"phone": [{"value": phone, "enum_code": "WORK"}]},
         )
         resp.raise_for_status()
-        logger.info("Телефон компании обновлён: %s", phone)
-
 
 async def _create_deal(
     deal_name: str,
@@ -179,13 +157,7 @@ async def _create_deal(
     agent_name: Optional[str],
     inn: Optional[str],
 ) -> int:
-    """
-    Создаёт сделку в AmoCRM на этапе DEAL_PIPELINE_STATUS_ID,
-    привязывает компанию и ставит тег DEAL_TAG.
-    Весь текст OCR идёт в примечание.
-    """
     base_url = f"https://{AMO_SUBDOMAIN}.amocrm.ru/api/v4"
-
     deal_payload: dict = {
         "name": deal_name,
         "status_id": DEAL_PIPELINE_STATUS_ID,
@@ -194,7 +166,6 @@ async def _create_deal(
             "tags": [{"name": DEAL_TAG}],
         },
     }
-
     async with httpx.AsyncClient() as client:
         resp = await client.post(
             f"{base_url}/leads",
@@ -203,28 +174,25 @@ async def _create_deal(
         )
         resp.raise_for_status()
         deal_id = resp.json()["_embedded"]["leads"][0]["id"]
-        logger.info("Сделка создана (id=%s) с тегом '%s'", deal_id, DEAL_TAG)
+        logger.info("Сделка создана (id=%s) тег=%s", deal_id, DEAL_TAG)
 
-        note_payload = {
-            "entity_id": deal_id,
-            "note_type": "common",
-            "params": {"text": f"📄 OCR-текст с фото:\n\n{full_text}"},
-        }
         await client.post(
             f"{base_url}/leads/notes",
             headers=_amo_headers(),
-            json=[note_payload],
+            json=[{
+                "entity_id": deal_id,
+                "note_type": "common",
+                "params": {"text": f"📄 OCR-текст с фото:\n\n{full_text}"},
+            }],
         )
 
         if agent_name and COMPANY_FIELD_AGENT:
             await client.patch(
                 f"{base_url}/companies/{company_id}",
                 headers=_amo_headers(),
-                json={
-                    "custom_fields_values": [
-                        {"field_id": COMPANY_FIELD_AGENT, "values": [{"value": agent_name}]}
-                    ]
-                },
+                json={"custom_fields_values": [
+                    {"field_id": COMPANY_FIELD_AGENT, "values": [{"value": agent_name}]}
+                ]},
             )
 
     if agent_phone:
@@ -232,8 +200,7 @@ async def _create_deal(
 
     return deal_id
 
-
-# ─── OCR через OpenAI Vision ─────────────────────────────────────────────────
+# ─── OCR ─────────────────────────────────────────────────────────────────────
 
 async def _ocr_photo(image_b64: str, mime: str, system_prompt: str) -> dict:
     import json
@@ -242,19 +209,13 @@ async def _ocr_photo(image_b64: str, mime: str, system_prompt: str) -> dict:
         model=OPENAI_MODEL,
         messages=[
             {"role": "system", "content": system_prompt},
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "image_url",
-                        "image_url": {
-                            "url": f"data:{mime};base64,{image_b64}",
-                            "detail": "high",
-                        },
-                    },
-                    {"type": "text", "text": "Распознай поля по инструкции."},
-                ],
-            },
+            {"role": "user", "content": [
+                {"type": "image_url", "image_url": {
+                    "url": f"data:{mime};base64,{image_b64}",
+                    "detail": "high",
+                }},
+                {"type": "text", "text": "Распознай поля по инструкции."},
+            ]},
         ],
         max_tokens=4096,
         temperature=0.1,
@@ -266,25 +227,62 @@ async def _ocr_photo(image_b64: str, mime: str, system_prompt: str) -> dict:
             raw = raw[4:]
     return json.loads(raw)
 
+# ─── Вспомогательные сообщения ────────────────────────────────────────────────
 
-# ─── ConversationHandler шаги ─────────────────────────────────────────────────
-
-async def handle_unknown(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Отвечает на любое сообщение вне активного сценария."""
-    await update.message.reply_text(
-        "🔑 Пришлите ваш уникальный код для начала работы."
+async def _ask_phone(message) -> None:
+    """Запросить телефон агента."""
+    await message.reply_text(
+        "📞 Введите <b>номер телефона</b> агента:\n"
+        "<i>Например: +79001234567</i>\n\n"
+        "Или нажмите /cancel для отмены.",
+        parse_mode=constants.ParseMode.HTML,
     )
 
+async def _ask_name(message) -> None:
+    """Запросить ФИО агента."""
+    await message.reply_text(
+        "👤 Введите <b>ФИО</b> агента:\n"
+        "<i>Например: Иванов Иван Иванович</i>\n\n"
+        "Или нажмите /cancel для отмены.",
+        parse_mode=constants.ParseMode.HTML,
+    )
 
+async def _ask_confirm(message, phone: str, name: str) -> None:
+    """Показать введённые данные и попросить подтвердить."""
+    await message.reply_text(
+        f"🔎 Проверьте введённые данные:\n\n"
+        f"📞 <b>Телефон:</b> {phone}\n"
+        f"👤 <b>ФИО:</b> {name}\n\n"
+        "Всё верно?",
+        parse_mode=constants.ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("✅ Да, отправить", callback_data="confirm_yes"),
+            InlineKeyboardButton("✏️ Исправить",    callback_data="confirm_edit"),
+        ], [
+            InlineKeyboardButton("🔄 Начать заново", callback_data="confirm_reset"),
+        ]]),
+    )
+
+# ─── Handlers ─────────────────────────────────────────────────────────────────
+
+async def handle_unknown(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text("🔑 Пришлите ваш уникальный код для начала работы.")
+
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text("🔑 Пришлите ваш уникальный код для начала работы.")
+
+async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.user_data.clear()
+    await update.message.reply_text("🚫 Операция отменена.")
+    return ConversationHandler.END
+
+# Шаг 1: код сценария
 async def handle_code(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     text = update.message.text.strip()
     scenario = SCENARIOS.get(text)
     if not scenario:
-        await update.message.reply_text(
-            "🔑 Пришлите ваш уникальный код для начала работы."
-        )
+        await update.message.reply_text("🔑 Пришлите ваш уникальный код для начала работы.")
         return ConversationHandler.END
-
     context.user_data["scenario_code"] = text
     context.user_data["scenario"] = scenario
     await update.message.reply_text(
@@ -294,12 +292,11 @@ async def handle_code(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
     )
     return WAIT_PHOTO
 
-
+# Шаг 2: фото → OCR
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     message = update.message
     if message.photo:
-        photo = message.photo[-1]
-        file_obj = await context.bot.get_file(photo.file_id)
+        file_obj = await context.bot.get_file(message.photo[-1].file_id)
         mime = "image/jpeg"
     elif message.document and message.document.mime_type.startswith("image/"):
         file_obj = await context.bot.get_file(message.document.file_id)
@@ -313,9 +310,8 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     await file_obj.download_to_memory(buf)
     image_b64 = base64.b64encode(buf.getvalue()).decode()
 
-    scenario = context.user_data["scenario"]
     try:
-        ocr_data = await _ocr_photo(image_b64, mime, scenario["system_prompt"])
+        ocr_data = await _ocr_photo(image_b64, mime, context.user_data["scenario"]["system_prompt"])
     except Exception as exc:
         logger.exception("Ошибка OCR")
         await status_msg.edit_text(f"❌ Ошибка распознавания: {exc}")
@@ -331,32 +327,83 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         f"🔍 Распознано:\n"
         f"• <b>Компания:</b> {company_name}\n"
         f"• <b>ИНН:</b> {inn}\n\n"
-        "❓ <b>Имеется ли номер телефона и ФИО агента?</b>\n\n"
-        "Нажмите <b>Нет</b> или напишите данные в формате:\n"
-        "<code>+79001234567 Иванов Иван Иванович</code>",
+        "❓ <b>Имеется ли номер телефона и ФИО агента?</b>",
         parse_mode=constants.ParseMode.HTML,
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("Нет", callback_data="agent_no")]
-        ]),
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("Да", callback_data="agent_yes"),
+            InlineKeyboardButton("Нет", callback_data="agent_no"),
+        ]]),
     )
-    return WAIT_AGENT
+    return WAIT_AGENT_CHOICE
 
-
+# Шаг 3а: агента нет → сразу в АМО
 async def handle_agent_no(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     await update.callback_query.answer()
     await update.callback_query.edit_message_reply_markup(reply_markup=None)
     await update.callback_query.message.reply_text("👌 Агент не указан. Создаю запись в AmoCRM…")
     return await _push_to_amo(update.callback_query.message, context, phone=None, name=None)
 
+# Шаг 3б: агент есть → запрашиваем телефон
+async def handle_agent_yes(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    await update.callback_query.answer()
+    await update.callback_query.edit_message_reply_markup(reply_markup=None)
+    await _ask_phone(update.callback_query.message)
+    return WAIT_PHONE
 
-async def handle_agent_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    text = update.message.text.strip()
-    parts = text.split(None, 1)
-    phone = parts[0] if parts else None
-    name = parts[1] if len(parts) > 1 else None
-    await update.message.reply_text("👌 Данные получены. Создаю запись в AmoCRM…")
-    return await _push_to_amo(update.message, context, phone=phone, name=name)
+# Шаг 4: получаем телефон
+async def handle_phone_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.user_data["agent_phone"] = update.message.text.strip()
+    await _ask_name(update.message)
+    return WAIT_NAME
 
+# Шаг 5: получаем ФИО
+async def handle_name_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.user_data["agent_name"] = update.message.text.strip()
+    await _ask_confirm(
+        update.message,
+        phone=context.user_data["agent_phone"],
+        name=context.user_data["agent_name"],
+    )
+    return WAIT_CONFIRM
+
+# Шаг 6: подтверждение
+async def handle_confirm_yes(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Данные подтверждены — отправляем в АМО."""
+    await update.callback_query.answer()
+    await update.callback_query.edit_message_reply_markup(reply_markup=None)
+    await update.callback_query.message.reply_text("👌 Данные подтверждены. Создаю запись в AmoCRM…")
+    return await _push_to_amo(
+        update.callback_query.message,
+        context,
+        phone=context.user_data.get("agent_phone"),
+        name=context.user_data.get("agent_name"),
+    )
+
+async def handle_confirm_edit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Редактировать — заново запрашиваем телефон."""
+    await update.callback_query.answer()
+    await update.callback_query.edit_message_reply_markup(reply_markup=None)
+    context.user_data.pop("agent_phone", None)
+    context.user_data.pop("agent_name", None)
+    await _ask_phone(update.callback_query.message)
+    return WAIT_PHONE
+
+async def handle_confirm_reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Полный сброс — возвращаемся к отправке фото."""
+    await update.callback_query.answer()
+    await update.callback_query.edit_message_reply_markup(reply_markup=None)
+    # Сохраняем только сценарий, всё остальное сбрасываем
+    scenario = context.user_data.get("scenario")
+    scenario_code = context.user_data.get("scenario_code")
+    context.user_data.clear()
+    context.user_data["scenario"] = scenario
+    context.user_data["scenario_code"] = scenario_code
+    await update.callback_query.message.reply_text(
+        "🔄 Данные сброшены.\n\n📸 Отправьте фото документа заново."
+    )
+    return WAIT_PHOTO
+
+# ─── Отправка в АМО ───────────────────────────────────────────────────────────
 
 async def _push_to_amo(
     message,
@@ -371,7 +418,7 @@ async def _push_to_amo(
 
     try:
         company_id = await _find_or_create_company(company_name, inn)
-        deal_id = await _create_deal(
+        await _create_deal(
             deal_name=company_name,
             company_id=company_id,
             full_text=full_text,
@@ -392,19 +439,6 @@ async def _push_to_amo(
     context.user_data.clear()
     return ConversationHandler.END
 
-
-async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    context.user_data.clear()
-    await update.message.reply_text("🚫 Операция отменена.")
-    return ConversationHandler.END
-
-
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text(
-        "🔑 Пришлите ваш уникальный код для начала работы."
-    )
-
-
 # ─── Запуск ───────────────────────────────────────────────────────────────────
 
 def main() -> None:
@@ -416,7 +450,6 @@ def main() -> None:
         raise RuntimeError("AMO_SUBDOMAIN / AMO_ACCESS_TOKEN не заданы.")
 
     logger.info("Запуск бота (модель: %s)…", OPENAI_MODEL)
-
     app = Application.builder().token(TELEGRAM_TOKEN).build()
 
     conv = ConversationHandler(
@@ -430,9 +463,20 @@ def main() -> None:
             WAIT_PHOTO: [
                 MessageHandler(filters.PHOTO | filters.Document.IMAGE, handle_photo)
             ],
-            WAIT_AGENT: [
-                CallbackQueryHandler(handle_agent_no, pattern="^agent_no$"),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_agent_text),
+            WAIT_AGENT_CHOICE: [
+                CallbackQueryHandler(handle_agent_yes,  pattern="^agent_yes$"),
+                CallbackQueryHandler(handle_agent_no,   pattern="^agent_no$"),
+            ],
+            WAIT_PHONE: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_phone_input)
+            ],
+            WAIT_NAME: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_name_input)
+            ],
+            WAIT_CONFIRM: [
+                CallbackQueryHandler(handle_confirm_yes,   pattern="^confirm_yes$"),
+                CallbackQueryHandler(handle_confirm_edit,  pattern="^confirm_edit$"),
+                CallbackQueryHandler(handle_confirm_reset, pattern="^confirm_reset$"),
             ],
         },
         fallbacks=[CommandHandler("cancel", cmd_cancel)],
@@ -442,7 +486,6 @@ def main() -> None:
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("cancel", cmd_cancel))
     app.add_handler(conv)
-    # Любое сообщение вне сценария — просим прислать код
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_unknown))
 
     logger.info("Бот запущен.")
