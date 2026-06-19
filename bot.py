@@ -1,9 +1,3 @@
-#!/usr/bin/env python3
-"""
-Telegram-бот для OCR лизинговых заявок + интеграция с AmoCRM.
-Сценарии запускаются по коду (например, 5800).
-"""
-
 import os
 import base64
 import logging
