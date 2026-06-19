@@ -96,14 +96,40 @@ def _amo_headers() -> dict:
     }
 
 
-async def _create_company(company_name: str, inn: Optional[str]) -> int:
-    """Создаёт новую компанию всегда, без поиска дубликатов."""
+async def _create_company(
+    company_name: str,
+    inn: Optional[str],
+    phone: Optional[str] = None,
+    agent_name: Optional[str] = None,
+) -> int:
+    """Создаёт новую компанию, заполняя все поля за один запрос."""
     base_url = f"https://{AMO_SUBDOMAIN}.amocrm.ru/api/v4"
-    payload: dict = {"name": company_name}
+
+    custom_fields: list = []
+
     if inn and COMPANY_FIELD_INN:
-        payload["custom_fields_values"] = [
+        custom_fields.append(
             {"field_id": COMPANY_FIELD_INN, "values": [{"value": inn}]}
-        ]
+        )
+
+    if agent_name and COMPANY_FIELD_AGENT:
+        custom_fields.append(
+            {"field_id": COMPANY_FIELD_AGENT, "values": [{"value": agent_name}]}
+        )
+
+    # Телефон — стандартное поле AmoCRM, заполняется через field_code="PHONE"
+    if phone:
+        custom_fields.append(
+            {
+                "field_code": "PHONE",
+                "values": [{"value": phone, "enum_code": "WORK"}],
+            }
+        )
+
+    payload: dict = {"name": company_name}
+    if custom_fields:
+        payload["custom_fields_values"] = custom_fields
+
     async with httpx.AsyncClient() as client:
         resp = await client.post(
             f"{base_url}/companies",
@@ -116,24 +142,10 @@ async def _create_company(company_name: str, inn: Optional[str]) -> int:
         return company_id
 
 
-async def _update_company_phone(company_id: int, phone: str) -> None:
-    base_url = f"https://{AMO_SUBDOMAIN}.amocrm.ru/api/v4"
-    async with httpx.AsyncClient() as client:
-        resp = await client.patch(
-            f"{base_url}/companies/{company_id}",
-            headers=_amo_headers(),
-            json={"phone": [{"value": phone, "enum_code": "WORK"}]},
-        )
-        resp.raise_for_status()
-
-
 async def _create_deal(
     deal_name: str,
     company_id: int,
     full_text: str,
-    agent_phone: Optional[str],
-    agent_name: Optional[str],
-    inn: Optional[str],
 ) -> int:
     base_url = f"https://{AMO_SUBDOMAIN}.amocrm.ru/api/v4"
     deal_payload: dict = {
@@ -152,7 +164,7 @@ async def _create_deal(
         )
         resp.raise_for_status()
         deal_id = resp.json()["_embedded"]["leads"][0]["id"]
-        logger.info("Сделка создана (id=%s) тег=%s", deal_id, DEAL_TAG)
+        logger.info("Сделка создана (id=%s)", deal_id)
 
         await client.post(
             f"{base_url}/leads/notes",
@@ -163,18 +175,6 @@ async def _create_deal(
                 "params": {"text": f"📄 OCR-текст с фото:\n\n{full_text}"},
             }],
         )
-
-        if agent_name and COMPANY_FIELD_AGENT:
-            await client.patch(
-                f"{base_url}/companies/{company_id}",
-                headers=_amo_headers(),
-                json={"custom_fields_values": [
-                    {"field_id": COMPANY_FIELD_AGENT, "values": [{"value": agent_name}]}
-                ]},
-            )
-
-    if agent_phone:
-        await _update_company_phone(company_id, agent_phone)
 
     return deal_id
 
@@ -381,14 +381,17 @@ async def _push_to_amo(
     full_text = ocr_data.get("full_text") or str(ocr_data)
 
     try:
-        company_id = await _create_company(company_name, inn)
+        # Создаём компанию сразу со всеми полями за один запрос
+        company_id = await _create_company(
+            company_name=company_name,
+            inn=inn,
+            phone=phone,
+            agent_name=name,
+        )
         await _create_deal(
             deal_name=company_name,
             company_id=company_id,
             full_text=full_text,
-            agent_phone=phone,
-            agent_name=name,
-            inn=inn,
         )
         await message.reply_text(
             f"✅ <b>Готово!</b>\n\n"
