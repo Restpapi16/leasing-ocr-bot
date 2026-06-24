@@ -34,6 +34,9 @@ COMPANY_FIELD_AGENT = 711655
 DEAL_PIPELINE_STATUS_ID = 70009922
 DEAL_TAG = "Лизинг_OCR"
 
+# ─── Таймаут для запросов к AmoCRM ───────────────────────────────────────────
+AMO_TIMEOUT = httpx.Timeout(30.0)  # connect + read + write = 30 сек
+
 # ─── Состояния диалога ───────────────────────────────────────────────────────
 (
     WAIT_PHOTO,
@@ -133,7 +136,7 @@ async def _create_company(
     if custom_fields:
         payload["custom_fields_values"] = custom_fields
 
-    async with httpx.AsyncClient() as client:
+    async with httpx.AsyncClient(timeout=AMO_TIMEOUT) as client:
         resp = await client.post(
             f"{base_url}/companies",
             headers=_amo_headers(),
@@ -159,7 +162,7 @@ async def _create_deal(
             "tags": [{"name": DEAL_TAG}],
         },
     }
-    async with httpx.AsyncClient() as client:
+    async with httpx.AsyncClient(timeout=AMO_TIMEOUT) as client:
         resp = await client.post(
             f"{base_url}/leads",
             headers=_amo_headers(),
@@ -306,7 +309,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         ocr_data = await _ocr_photo(image_b64, mime, context.user_data["scenario"]["system_prompt"])
     except Exception as exc:
         logger.exception("Ошибка OCR")
-        await status_msg.edit_text(f"❌ Ошибка распознавания: {exc}")
+        await status_msg.edit_text(f"❌ Ошибка распознавания: {type(exc).__name__}: {exc}")
         return ConversationHandler.END
 
     context.user_data["ocr_data"] = ocr_data
@@ -473,7 +476,6 @@ async def _push_to_amo(
     full_text = ocr_data.get("full_text") or str(ocr_data)
 
     try:
-        # Создаём компанию сразу со всеми полями за один запрос
         company_id = await _create_company(
             company_name=company_name,
             inn=inn,
@@ -491,9 +493,27 @@ async def _push_to_amo(
             f"📋 Сделка создана.",
             parse_mode=constants.ParseMode.HTML,
         )
+    except httpx.TimeoutException as exc:
+        logger.exception("Таймаут при запросе к AmoCRM")
+        await message.reply_text(
+            f"⏱ <b>Таймаут AmoCRM</b> — сервер не ответил вовремя.\n"
+            f"Попробуйте повторить через несколько секунд.\n"
+            f"<i>({type(exc).__name__})</i>",
+            parse_mode=constants.ParseMode.HTML,
+        )
+    except httpx.HTTPStatusError as exc:
+        logger.exception("HTTP-ошибка AmoCRM")
+        await message.reply_text(
+            f"❌ <b>Ошибка AmoCRM {exc.response.status_code}</b>\n"
+            f"<i>{exc.response.text[:300]}</i>",
+            parse_mode=constants.ParseMode.HTML,
+        )
     except Exception as exc:
-        logger.exception("Ошибка при отправке в AmoCRM")
-        await message.reply_text(f"❌ Ошибка AmoCRM: {exc}")
+        logger.exception("Неизвестная ошибка при отправке в AmoCRM")
+        await message.reply_text(
+            f"❌ <b>Ошибка AmoCRM</b>: {type(exc).__name__}: {exc}",
+            parse_mode=constants.ParseMode.HTML,
+        )
 
     context.user_data.clear()
     return ConversationHandler.END
