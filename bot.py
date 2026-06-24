@@ -37,11 +37,14 @@ DEAL_TAG = "Лизинг_OCR"
 # ─── Состояния диалога ───────────────────────────────────────────────────────
 (
     WAIT_PHOTO,
+    WAIT_OCR_CONFIRM,
+    WAIT_EDIT_COMPANY,
+    WAIT_EDIT_INN,
     WAIT_AGENT_CHOICE,
     WAIT_PHONE,
     WAIT_NAME,
     WAIT_CONFIRM,
-) = range(5)
+) = range(8)
 
 # ─── Сценарии ─────────────────────────────────────────────────────────────────
 SCENARIOS = {
@@ -207,6 +210,22 @@ async def _ocr_photo(image_b64: str, mime: str, system_prompt: str) -> dict:
 
 # ─── Вспомогательные сообщения ────────────────────────────────────────────────
 
+async def _show_ocr_confirm(message, company_name: str, inn: str) -> None:
+    """Показывает результат OCR и просит пользователя подтвердить или исправить."""
+    await message.reply_text(
+        f"🔍 <b>Распознано:</b>\n"
+        f"• <b>Компания:</b> {company_name}\n"
+        f"• <b>ИНН:</b> {inn}\n\n"
+        "Всё верно?",
+        parse_mode=constants.ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("✅ Верно", callback_data="ocr_confirm_ok"),
+        ], [
+            InlineKeyboardButton("✏️ Изменить компанию", callback_data="ocr_edit_company"),
+            InlineKeyboardButton("✏️ Изменить ИНН",     callback_data="ocr_edit_inn"),
+        ]]),
+    )
+
 async def _ask_phone(message) -> None:
     await message.reply_text(
         "📞 Введите <b>номер телефона</b> агента:\n"
@@ -296,8 +315,24 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     company_name = ocr_data.get("company_name") or "—"
     inn = ocr_data.get("inn") or "—"
 
-    await message.reply_text(
-        f"🔍 Распознано:\n"
+    # Просим пользователя подтвердить или исправить распознанные данные
+    await _show_ocr_confirm(message, company_name, inn)
+    return WAIT_OCR_CONFIRM
+
+
+# ─── Подтверждение / правка OCR-данных ───────────────────────────────────────
+
+async def handle_ocr_confirm_ok(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Пользователь подтвердил — переходим к вопросу про агента."""
+    await update.callback_query.answer()
+    await update.callback_query.edit_message_reply_markup(reply_markup=None)
+
+    ocr_data = context.user_data.get("ocr_data", {})
+    company_name = ocr_data.get("company_name") or "—"
+    inn = ocr_data.get("inn") or "—"
+
+    await update.callback_query.message.reply_text(
+        f"✅ Данные подтверждены:\n"
         f"• <b>Компания:</b> {company_name}\n"
         f"• <b>ИНН:</b> {inn}\n\n"
         "❓ <b>Имеется ли номер телефона и ФИО агента?</b>",
@@ -308,6 +343,63 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         ]]),
     )
     return WAIT_AGENT_CHOICE
+
+
+async def handle_ocr_edit_company(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Пользователь хочет исправить название компании."""
+    await update.callback_query.answer()
+    await update.callback_query.edit_message_reply_markup(reply_markup=None)
+    current = context.user_data.get("ocr_data", {}).get("company_name") or "—"
+    await update.callback_query.message.reply_text(
+        f"✏️ Текущее наименование: <b>{current}</b>\n\n"
+        "Введите правильное <b>наименование компании</b>:\n"
+        "Или нажмите /cancel для отмены.",
+        parse_mode=constants.ParseMode.HTML,
+    )
+    return WAIT_EDIT_COMPANY
+
+
+async def handle_ocr_edit_inn(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Пользователь хочет исправить ИНН."""
+    await update.callback_query.answer()
+    await update.callback_query.edit_message_reply_markup(reply_markup=None)
+    current = context.user_data.get("ocr_data", {}).get("inn") or "—"
+    await update.callback_query.message.reply_text(
+        f"✏️ Текущий ИНН: <b>{current}</b>\n\n"
+        "Введите правильный <b>ИНН</b>:\n"
+        "Или нажмите /cancel для отмены.",
+        parse_mode=constants.ParseMode.HTML,
+    )
+    return WAIT_EDIT_INN
+
+
+async def handle_edit_company_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Получили новое название компании — сохраняем и снова показываем данные для проверки."""
+    new_company = update.message.text.strip()
+    context.user_data.setdefault("ocr_data", {})["company_name"] = new_company
+    inn = context.user_data["ocr_data"].get("inn") or "—"
+    await update.message.reply_text(
+        f"✅ Наименование обновлено: <b>{new_company}</b>",
+        parse_mode=constants.ParseMode.HTML,
+    )
+    await _show_ocr_confirm(update.message, new_company, inn)
+    return WAIT_OCR_CONFIRM
+
+
+async def handle_edit_inn_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Получили новый ИНН — сохраняем и снова показываем данные для проверки."""
+    new_inn = update.message.text.strip()
+    context.user_data.setdefault("ocr_data", {})["inn"] = new_inn
+    company_name = context.user_data["ocr_data"].get("company_name") or "—"
+    await update.message.reply_text(
+        f"✅ ИНН обновлён: <b>{new_inn}</b>",
+        parse_mode=constants.ParseMode.HTML,
+    )
+    await _show_ocr_confirm(update.message, company_name, new_inn)
+    return WAIT_OCR_CONFIRM
+
+
+# ─── Агент ────────────────────────────────────────────────────────────────────
 
 async def handle_agent_no(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     await update.callback_query.answer()
@@ -429,6 +521,17 @@ def main() -> None:
         states={
             WAIT_PHOTO: [
                 MessageHandler(filters.PHOTO | filters.Document.IMAGE, handle_photo)
+            ],
+            WAIT_OCR_CONFIRM: [
+                CallbackQueryHandler(handle_ocr_confirm_ok,     pattern="^ocr_confirm_ok$"),
+                CallbackQueryHandler(handle_ocr_edit_company,   pattern="^ocr_edit_company$"),
+                CallbackQueryHandler(handle_ocr_edit_inn,       pattern="^ocr_edit_inn$"),
+            ],
+            WAIT_EDIT_COMPANY: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_edit_company_input)
+            ],
+            WAIT_EDIT_INN: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_edit_inn_input)
             ],
             WAIT_AGENT_CHOICE: [
                 CallbackQueryHandler(handle_agent_yes, pattern="^agent_yes$"),
