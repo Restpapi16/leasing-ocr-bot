@@ -35,7 +35,7 @@ DEAL_PIPELINE_STATUS_ID = 70009922
 DEAL_TAG = "Лизинг_OCR"
 
 # ─── Таймаут для запросов к AmoCRM ───────────────────────────────────────────
-AMO_TIMEOUT = httpx.Timeout(30.0)  # connect + read + write = 30 сек
+AMO_TIMEOUT = httpx.Timeout(30.0)
 
 # ─── Состояния диалога ───────────────────────────────────────────────────────
 (
@@ -106,7 +106,7 @@ async def _create_company(
     company_name: str,
     inn: Optional[str],
     phone: Optional[str] = None,
-    agent_name: Optional[str] = None,
+    lpr_name: Optional[str] = None,
 ) -> int:
     """Создаёт новую компанию, заполняя все поля за один запрос."""
     base_url = f"https://{AMO_SUBDOMAIN}.amocrm.ru/api/v4"
@@ -118,12 +118,11 @@ async def _create_company(
             {"field_id": COMPANY_FIELD_INN, "values": [{"value": inn}]}
         )
 
-    if agent_name and COMPANY_FIELD_AGENT:
+    if lpr_name and COMPANY_FIELD_AGENT:
         custom_fields.append(
-            {"field_id": COMPANY_FIELD_AGENT, "values": [{"value": agent_name}]}
+            {"field_id": COMPANY_FIELD_AGENT, "values": [{"value": lpr_name}]}
         )
 
-    # Телефон — стандартное поле AmoCRM, заполняется через field_code="PHONE"
     if phone:
         custom_fields.append(
             {
@@ -213,8 +212,9 @@ async def _ocr_photo(image_b64: str, mime: str, system_prompt: str) -> dict:
 
 # ─── Вспомогательные сообщения ────────────────────────────────────────────────
 
+ASK_CODE_MSG = "🔑 Пришлите свой уникальный код."
+
 async def _show_ocr_confirm(message, company_name: str, inn: str) -> None:
-    """Показывает результат OCR и просит пользователя подтвердить или исправить."""
     await message.reply_text(
         f"🔍 <b>Распознано:</b>\n"
         f"• <b>Компания:</b> {company_name}\n"
@@ -231,7 +231,7 @@ async def _show_ocr_confirm(message, company_name: str, inn: str) -> None:
 
 async def _ask_phone(message) -> None:
     await message.reply_text(
-        "📞 Введите <b>номер телефона</b> агента:\n"
+        "📞 Введите <b>номер телефона</b> ЛПР:\n"
         "<i>Например: +79001234567</i>\n\n"
         "Или нажмите /cancel для отмены.",
         parse_mode=constants.ParseMode.HTML,
@@ -239,7 +239,7 @@ async def _ask_phone(message) -> None:
 
 async def _ask_name(message) -> None:
     await message.reply_text(
-        "👤 Введите <b>ФИО</b> агента:\n"
+        "👤 Введите <b>ФИО</b> ЛПР:\n"
         "<i>Например: Иванов Иван Иванович</i>\n\n"
         "Или нажмите /cancel для отмены.",
         parse_mode=constants.ParseMode.HTML,
@@ -247,7 +247,7 @@ async def _ask_name(message) -> None:
 
 async def _ask_confirm(message, phone: str, name: str) -> None:
     await message.reply_text(
-        f"🔎 Проверьте введённые данные:\n\n"
+        f"🔎 Проверьте данные ЛПР:\n\n"
         f"📞 <b>Телефон:</b> {phone}\n"
         f"👤 <b>ФИО:</b> {name}\n\n"
         "Всё верно?",
@@ -263,10 +263,11 @@ async def _ask_confirm(message, phone: str, name: str) -> None:
 # ─── Handlers ─────────────────────────────────────────────────────────────────
 
 async def handle_unknown(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text("🔑 Пришлите ваш уникальный код для начала работы.")
+    """Отвечает на ЛЮБОЕ сообщение вне активного сценария."""
+    await update.effective_message.reply_text(ASK_CODE_MSG)
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text("🔑 Пришлите ваш уникальный код для начала работы.")
+    await update.message.reply_text(ASK_CODE_MSG)
 
 async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data.clear()
@@ -277,7 +278,7 @@ async def handle_code(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
     text = update.message.text.strip()
     scenario = SCENARIOS.get(text)
     if not scenario:
-        await update.message.reply_text("🔑 Пришлите ваш уникальный код для начала работы.")
+        await update.message.reply_text(ASK_CODE_MSG)
         return ConversationHandler.END
     context.user_data["scenario_code"] = text
     context.user_data["scenario"] = scenario
@@ -318,7 +319,6 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     company_name = ocr_data.get("company_name") or "—"
     inn = ocr_data.get("inn") or "—"
 
-    # Просим пользователя подтвердить или исправить распознанные данные
     await _show_ocr_confirm(message, company_name, inn)
     return WAIT_OCR_CONFIRM
 
@@ -326,7 +326,6 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
 # ─── Подтверждение / правка OCR-данных ───────────────────────────────────────
 
 async def handle_ocr_confirm_ok(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Пользователь подтвердил — переходим к вопросу про агента."""
     await update.callback_query.answer()
     await update.callback_query.edit_message_reply_markup(reply_markup=None)
 
@@ -338,7 +337,7 @@ async def handle_ocr_confirm_ok(update: Update, context: ContextTypes.DEFAULT_TY
         f"✅ Данные подтверждены:\n"
         f"• <b>Компания:</b> {company_name}\n"
         f"• <b>ИНН:</b> {inn}\n\n"
-        "❓ <b>Имеется ли номер телефона и ФИО агента?</b>",
+        "❓ <b>Имеется ли номер телефона и ФИО ЛПР?</b>",
         parse_mode=constants.ParseMode.HTML,
         reply_markup=InlineKeyboardMarkup([[
             InlineKeyboardButton("Да", callback_data="agent_yes"),
@@ -349,7 +348,6 @@ async def handle_ocr_confirm_ok(update: Update, context: ContextTypes.DEFAULT_TY
 
 
 async def handle_ocr_edit_company(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Пользователь хочет исправить название компании."""
     await update.callback_query.answer()
     await update.callback_query.edit_message_reply_markup(reply_markup=None)
     current = context.user_data.get("ocr_data", {}).get("company_name") or "—"
@@ -363,7 +361,6 @@ async def handle_ocr_edit_company(update: Update, context: ContextTypes.DEFAULT_
 
 
 async def handle_ocr_edit_inn(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Пользователь хочет исправить ИНН."""
     await update.callback_query.answer()
     await update.callback_query.edit_message_reply_markup(reply_markup=None)
     current = context.user_data.get("ocr_data", {}).get("inn") or "—"
@@ -377,7 +374,6 @@ async def handle_ocr_edit_inn(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 async def handle_edit_company_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Получили новое название компании — сохраняем и снова показываем данные для проверки."""
     new_company = update.message.text.strip()
     context.user_data.setdefault("ocr_data", {})["company_name"] = new_company
     inn = context.user_data["ocr_data"].get("inn") or "—"
@@ -390,7 +386,6 @@ async def handle_edit_company_input(update: Update, context: ContextTypes.DEFAUL
 
 
 async def handle_edit_inn_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Получили новый ИНН — сохраняем и снова показываем данные для проверки."""
     new_inn = update.message.text.strip()
     context.user_data.setdefault("ocr_data", {})["inn"] = new_inn
     company_name = context.user_data["ocr_data"].get("company_name") or "—"
@@ -402,12 +397,12 @@ async def handle_edit_inn_input(update: Update, context: ContextTypes.DEFAULT_TY
     return WAIT_OCR_CONFIRM
 
 
-# ─── Агент ────────────────────────────────────────────────────────────────────
+# ─── ЛПР ──────────────────────────────────────────────────────────────────────
 
 async def handle_agent_no(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     await update.callback_query.answer()
     await update.callback_query.edit_message_reply_markup(reply_markup=None)
-    await update.callback_query.message.reply_text("👌 Агент не указан. Создаю запись в AmoCRM…")
+    await update.callback_query.message.reply_text("👌 ЛПР не указан. Создаю запись в AmoCRM…")
     return await _push_to_amo(update.callback_query.message, context, phone=None, name=None)
 
 async def handle_agent_yes(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -417,35 +412,35 @@ async def handle_agent_yes(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     return WAIT_PHONE
 
 async def handle_phone_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    context.user_data["agent_phone"] = update.message.text.strip()
+    context.user_data["lpr_phone"] = update.message.text.strip()
     await _ask_name(update.message)
     return WAIT_NAME
 
 async def handle_name_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    context.user_data["agent_name"] = update.message.text.strip()
+    context.user_data["lpr_name"] = update.message.text.strip()
     await _ask_confirm(
         update.message,
-        phone=context.user_data["agent_phone"],
-        name=context.user_data["agent_name"],
+        phone=context.user_data["lpr_phone"],
+        name=context.user_data["lpr_name"],
     )
     return WAIT_CONFIRM
 
 async def handle_confirm_yes(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     await update.callback_query.answer()
     await update.callback_query.edit_message_reply_markup(reply_markup=None)
-    await update.callback_query.message.reply_text("👌 Данные подтверждены. Создаю запись в AmoCRM…")
+    await update.callback_query.message.reply_text("👌 Данные ЛПР подтверждены. Создаю запись в AmoCRM…")
     return await _push_to_amo(
         update.callback_query.message,
         context,
-        phone=context.user_data.get("agent_phone"),
-        name=context.user_data.get("agent_name"),
+        phone=context.user_data.get("lpr_phone"),
+        name=context.user_data.get("lpr_name"),
     )
 
 async def handle_confirm_edit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     await update.callback_query.answer()
     await update.callback_query.edit_message_reply_markup(reply_markup=None)
-    context.user_data.pop("agent_phone", None)
-    context.user_data.pop("agent_name", None)
+    context.user_data.pop("lpr_phone", None)
+    context.user_data.pop("lpr_name", None)
     await _ask_phone(update.callback_query.message)
     return WAIT_PHONE
 
@@ -480,7 +475,7 @@ async def _push_to_amo(
             company_name=company_name,
             inn=inn,
             phone=phone,
-            agent_name=name,
+            lpr_name=name,
         )
         await _create_deal(
             deal_name=company_name,
@@ -540,7 +535,9 @@ def main() -> None:
         ],
         states={
             WAIT_PHOTO: [
-                MessageHandler(filters.PHOTO | filters.Document.IMAGE, handle_photo)
+                MessageHandler(filters.PHOTO | filters.Document.IMAGE, handle_photo),
+                # Любой текст в состоянии ожидания фото — просим отправить фото
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_photo),
             ],
             WAIT_OCR_CONFIRM: [
                 CallbackQueryHandler(handle_ocr_confirm_ok,     pattern="^ocr_confirm_ok$"),
@@ -576,7 +573,8 @@ def main() -> None:
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("cancel", cmd_cancel))
     app.add_handler(conv)
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_unknown))
+    # Вне сценария: любое сообщение (текст, фото, стикер и т..д.) — просим код
+    app.add_handler(MessageHandler(~filters.COMMAND, handle_unknown))
 
     logger.info("Бот запущен.")
     app.run_polling(allowed_updates=["message", "callback_query"])
