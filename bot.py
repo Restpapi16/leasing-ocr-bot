@@ -28,7 +28,6 @@ AMO_SUBDOMAIN    = os.getenv("AMO_SUBDOMAIN", "")
 AMO_ACCESS_TOKEN = os.getenv("AMO_ACCESS_TOKEN", "")
 
 # Chat ID админа: получите через @userinfobot или напишите боту /start — выведется в лог INFO
-# Если переменная не задана — уведомления админу отправляться не будут
 ADMIN_CHAT_ID_STR = os.getenv("ADMIN_CHAT_ID", "")
 ADMIN_CHAT_ID: Optional[int] = int(ADMIN_CHAT_ID_STR) if ADMIN_CHAT_ID_STR.lstrip("-").isdigit() else None
 
@@ -39,7 +38,6 @@ COMPANY_FIELD_AGENT = 711655
 DEAL_PIPELINE_STATUS_ID = 70009922
 DEAL_TAG = "Лизинг_OCR"
 
-# ─── Таймаут для запросов к AmoCRM ───────────────────────────────────────────
 AMO_TIMEOUT = httpx.Timeout(30.0)
 
 # ─── Состояния диалога ───────────────────────────────────────────────────────
@@ -190,9 +188,11 @@ async def _notify_admin(
     lpr_name: Optional[str],
 ) -> None:
     """
-    Отправляет админу (ADMIN_CHAT_ID):
-      1. Форвард исходного фото (через file_id, без повторной загрузки)
-      2. Карточку с полными OCR-данными + финальными данными ЛПР
+    Отправляет админу (ADMIN_CHAT_ID) 2 сообщения:
+      1. Фото с атрибутом (caption) — кто отправил + ключевые итоговые данные.
+         Файл-документ отправляется через send_document (не сжатое фото),
+         сжатое фото — через send_photo.
+      2. Карточка со всеми OCR-полями + полный распознанный текст.
     """
     if not ADMIN_CHAT_ID:
         return
@@ -202,27 +202,46 @@ async def _notify_admin(
     scenario_code = context.user_data.get("scenario_code", "—")
     scenario_desc = context.user_data.get("scenario", {}).get("description", "—")
 
-    # — 1. Пересылаем фото через file_id (сохранён в user_data.photo_file_id)
-    photo_file_id = context.user_data.get("photo_file_id")
-    if photo_file_id:
-        try:
-            await bot.send_photo(
-                chat_id=ADMIN_CHAT_ID,
-                photo=photo_file_id,
-                caption=(
-                    f"📸 <b>Исходное фото</b>\n"
-                    f"👤 Отправитель: {user_info} (id={user.id})\n"
-                    f"🔑 Сценарий: {scenario_code} — {scenario_desc}"
-                ),
-                parse_mode=constants.ParseMode.HTML,
-            )
-        except Exception:
-            logger.warning("Не удалось переслать фото админу", exc_info=True)
-
-    # — 2. Карточка с OCR-результатом и финальными данными
     def _f(val) -> str:
         return str(val) if val not in (None, "", "null") else "—"
 
+    # Caption для фото: ключевые данные (caption ограничен 1024 символами в TG)
+    caption = (
+        f"📸 <b>Исходное фото — тестовая заявка</b>\n"
+        f"👤 Отправитель: {user_info} (id={user.id})\n"
+        f"🔑 Сценарий: {scenario_code} — {scenario_desc}\n\n"
+        f"✅ <b>Финальные данные (подтверждено пользователем):</b>\n"
+        f"🏢 Компания: <b>{_f(ocr_data.get('company_name'))}</b>\n"
+        f"🔢 ИНН: <b>{_f(ocr_data.get('inn'))}</b>\n"
+        f"📞 Тел. ЛПР: <b>{_f(lpr_phone)}</b>\n"
+        f"👤 ФИО ЛПР: <b>{_f(lpr_name)}</b>"
+    )
+
+    # — 1. Отправляем фото с caption
+    photo_file_id   = context.user_data.get("photo_file_id")
+    is_document     = context.user_data.get("photo_is_document", False)
+    if photo_file_id:
+        try:
+            if is_document:
+                # Изображение отправлено без сжатия (как файл) — используем send_document
+                await bot.send_document(
+                    chat_id=ADMIN_CHAT_ID,
+                    document=photo_file_id,
+                    caption=caption,
+                    parse_mode=constants.ParseMode.HTML,
+                )
+            else:
+                # Обычное сжатое фото — send_photo
+                await bot.send_photo(
+                    chat_id=ADMIN_CHAT_ID,
+                    photo=photo_file_id,
+                    caption=caption,
+                    parse_mode=constants.ParseMode.HTML,
+                )
+        except Exception:
+            logger.warning("Не удалось отправить фото админу", exc_info=True)
+
+    # — 2. Карточка со всеми OCR-полями + полный текст
     ocr_block = (
         f"🔍 <b>OCR-распознавание (бот видел так):</b>\n"
         f"• Компания: {_f(ocr_data.get('company_name'))}\n"
@@ -236,17 +255,7 @@ async def _notify_admin(
         f"• Аванс: {_f(ocr_data.get('advance_pct'))}%\n"
         f"• Тип платежей: {_f(ocr_data.get('payment_type'))}"
     )
-
-    final_block = (
-        f"\n\n✅ <b>Финальные данные (подтверждено пользователем):</b>\n"
-        f"🏢 Компания: <b>{_f(ocr_data.get('company_name'))}</b>\n"
-        f"🔢 ИНН: <b>{_f(ocr_data.get('inn'))}</b>\n"
-        f"📞 Тел. ЛПР: <b>{_f(lpr_phone)}</b>\n"
-        f"👤 ФИО ЛПР: <b>{_f(lpr_name)}</b>"
-    )
-
     full_text = ocr_data.get("full_text") or "—"
-    # Ограничиваем full_text до 800 символов (лимит TG — 4096 на сообщение)
     full_text_block = f"\n\n📝 <b>Весь распознанный текст:</b>\n<code>{full_text[:800]}</code>"
     if len(full_text) > 800:
         full_text_block += "\n<i>… (текст обрезан)…</i>"
@@ -254,7 +263,7 @@ async def _notify_admin(
     try:
         await bot.send_message(
             chat_id=ADMIN_CHAT_ID,
-            text=ocr_block + final_block + full_text_block,
+            text=ocr_block + full_text_block,
             parse_mode=constants.ParseMode.HTML,
         )
     except Exception:
@@ -344,12 +353,13 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     message = update.message
     if message.photo:
         file_obj = await context.bot.get_file(message.photo[-1].file_id)
-        # Сохраняем file_id для пересылки админу
         context.user_data["photo_file_id"] = message.photo[-1].file_id
+        context.user_data["photo_is_document"] = False   # Сжатое фото
         mime = "image/jpeg"
     elif message.document and message.document.mime_type.startswith("image/"):
         file_obj = await context.bot.get_file(message.document.file_id)
         context.user_data["photo_file_id"] = message.document.file_id
+        context.user_data["photo_is_document"] = True    # Файл без сжатия
         mime = message.document.mime_type
     else:
         await message.reply_text("⚠️ Пожалуйста, отправьте фото.")
@@ -372,7 +382,6 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
 
     company_name = ocr_data.get("company_name") or "—"
     inn = ocr_data.get("inn") or "—"
-
     await _show_ocr_confirm(message, company_name, inn)
     return WAIT_OCR_CONFIRM
 
